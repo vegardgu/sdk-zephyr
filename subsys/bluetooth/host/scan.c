@@ -34,6 +34,11 @@
 
 #include <sys/types.h>
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+#include "sdc_hci_cmd_le.h"
+#include <multithreading_lock.h>
+#endif
+
 #include "addr_internal.h"
 #include "common/bt_str.h"
 #include "conn_internal.h"
@@ -129,7 +134,6 @@ void bt_scan_reset(void)
 static int cmd_le_set_ext_scan_enable(bool enable, bool filter_duplicates, uint16_t duration)
 {
 	struct bt_hci_cp_le_set_ext_scan_enable *cp;
-	struct bt_hci_cmd_state_set state;
 	struct net_buf *buf;
 	int err;
 
@@ -145,10 +149,24 @@ static int cmd_le_set_ext_scan_enable(bool enable, bool filter_duplicates, uint1
 	cp->duration = sys_cpu_to_le16(duration);
 	cp->period = 0;
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_set_ext_scan_enable_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_ext_scan_enable(
+			(const sdc_hci_cmd_le_set_ext_scan_enable_t *)cp));
+	net_buf_unref(buf);
+	if (!err) {
+		atomic_set_bit_to(bt_dev.flags, BT_DEV_SCANNING,
+				  enable == BT_HCI_LE_SCAN_ENABLE);
+	}
+#else
+	struct bt_hci_cmd_state_set state;
+
 	bt_hci_cmd_state_set_init(buf, &state, bt_dev.flags, BT_DEV_SCANNING,
 				  enable == BT_HCI_LE_SCAN_ENABLE);
 
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_EXT_SCAN_ENABLE, buf, NULL);
+#endif
 	if (err) {
 		return err;
 	}
@@ -159,7 +177,6 @@ static int cmd_le_set_ext_scan_enable(bool enable, bool filter_duplicates, uint1
 static int cmd_le_set_scan_enable_legacy(bool enable, bool filter_duplicates)
 {
 	struct bt_hci_cp_le_set_scan_enable *cp;
-	struct bt_hci_cmd_state_set state;
 	struct net_buf *buf;
 	int err;
 
@@ -173,10 +190,24 @@ static int cmd_le_set_scan_enable_legacy(bool enable, bool filter_duplicates)
 	cp->filter_dup = filter_duplicates;
 	cp->enable = enable;
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_set_scan_enable_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_scan_enable(
+			(const sdc_hci_cmd_le_set_scan_enable_t *)cp));
+	net_buf_unref(buf);
+	if (!err) {
+		atomic_set_bit_to(bt_dev.flags, BT_DEV_SCANNING,
+				  enable == BT_HCI_LE_SCAN_ENABLE);
+	}
+#else
+	struct bt_hci_cmd_state_set state;
+
 	bt_hci_cmd_state_set_init(buf, &state, bt_dev.flags, BT_DEV_SCANNING,
 				  enable == BT_HCI_LE_SCAN_ENABLE);
 
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_SCAN_ENABLE, buf, NULL);
+#endif
 	if (err) {
 		return err;
 	}
@@ -274,7 +305,19 @@ static int start_le_scan_ext(struct bt_le_scan_param *scan_param)
 		net_buf_add_mem(buf, phy_coded, sizeof(*phy_coded));
 	}
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*set_param) == sizeof(sdc_hci_cmd_le_set_ext_scan_params_t));
+	BUILD_ASSERT(sizeof(struct bt_hci_ext_scan_phy) ==
+			sizeof(sdc_hci_le_set_ext_scan_params_array_params_t));
+
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_ext_scan_params(
+			(const sdc_hci_cmd_le_set_ext_scan_params_t *)set_param));
+	net_buf_unref(buf);
+#else
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_EXT_SCAN_PARAM, buf, NULL);
+#endif
+
 	if (err) {
 		return err;
 	}
@@ -319,6 +362,13 @@ static int start_le_scan_legacy(struct bt_le_scan_param *param)
 		return err;
 	}
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(set_param) == sizeof(sdc_hci_cmd_le_set_scan_params_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_scan_params(
+			(const sdc_hci_cmd_le_set_scan_params_t *)&set_param));
+	(void)buf;
+#else
 	buf = bt_hci_cmd_alloc(K_FOREVER);
 	if (!buf) {
 		return -ENOBUFS;
@@ -327,6 +377,7 @@ static int start_le_scan_legacy(struct bt_le_scan_param *param)
 	net_buf_add_mem(buf, &set_param, sizeof(set_param));
 
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_SCAN_PARAM, buf, NULL);
+#endif
 	if (err) {
 		return err;
 	}

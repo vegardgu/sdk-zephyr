@@ -60,6 +60,12 @@
 #include "scan.h"
 #include "smp.h"
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+#include "sdc_hci_cmd_controller_baseband.h"
+#include "sdc_hci_cmd_le.h"
+#include <multithreading_lock.h>
+#endif
+
 #define LOG_LEVEL CONFIG_BT_CONN_LOG_LEVEL
 LOG_MODULE_REGISTER(bt_conn);
 
@@ -2077,6 +2083,8 @@ static int send_conn_le_param_update(struct bt_conn *conn,
 		return -EINVAL;
 	}
 
+/* SDC don't support peripheral initated param update. */
+#if defined(CONFIG_BT_CENTRAL) && defined(CONFIG_BT_LL_SOFTDEVICE)
 	/* Use LE connection parameter request if both local and remote support
 	 * it; or if local role is central then use LE connection update.
 	 */
@@ -2098,7 +2106,7 @@ static int send_conn_le_param_update(struct bt_conn *conn,
 
 		return rc;
 	}
-
+#endif
 	/* If remote central does not support LL Connection Parameters Request
 	 * Procedure
 	 */
@@ -2474,8 +2482,16 @@ int bt_conn_le_start_encryption(struct bt_conn *conn, uint8_t rand[8],
 	if (len < sizeof(cp->ltk)) {
 		(void)memset(cp->ltk + len, 0, sizeof(cp->ltk) - len);
 	}
-
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_enable_encryption_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_enable_encryption(
+			(const sdc_hci_cmd_le_enable_encryption_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_START_ENCRYPTION, buf, NULL);
+#endif
 }
 #endif /* CONFIG_BT_SMP */
 
@@ -2945,8 +2961,6 @@ static int bt_conn_get_tx_power_level(struct bt_conn *conn, uint8_t type,
 				      int8_t *tx_power_level)
 {
 	int err;
-	struct bt_hci_rp_read_tx_power_level *rp;
-	struct net_buf *rsp;
 	struct bt_hci_cp_read_tx_power_level *cp;
 	struct net_buf *buf;
 
@@ -2959,6 +2973,23 @@ static int bt_conn_get_tx_power_level(struct bt_conn *conn, uint8_t type,
 	cp->type = type;
 	cp->handle = sys_cpu_to_le16(conn->handle);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	sdc_hci_cmd_cb_read_transmit_power_level_return_t rsp;
+
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_cb_read_transmit_power_level_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_cb_read_transmit_power_level(
+			(const sdc_hci_cmd_cb_read_transmit_power_level_t *)cp, &rsp));
+	net_buf_unref(buf);
+	if (err) {
+		return err;
+	}
+
+	*tx_power_level = rsp.tx_power_level;
+#else
+	struct net_buf *rsp;
+	struct bt_hci_rp_read_tx_power_level *rp;
+
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_READ_TX_POWER_LEVEL, buf, &rsp);
 	if (err) {
 		return err;
@@ -2967,6 +2998,7 @@ static int bt_conn_get_tx_power_level(struct bt_conn *conn, uint8_t type,
 	rp = (void *) rsp->data;
 	*tx_power_level = rp->tx_power_level;
 	net_buf_unref(rsp);
+#endif
 
 	return 0;
 }
@@ -3302,7 +3334,16 @@ int bt_conn_le_subrate_request(struct bt_conn *conn,
 	cp->continuation_number = sys_cpu_to_le16(params->continuation_number);
 	cp->supervision_timeout = sys_cpu_to_le16(params->supervision_timeout);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_subrate_request_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_subrate_request(
+			(const sdc_hci_cmd_le_subrate_request_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_SUBRATE_REQUEST, buf, NULL);
+#endif /* CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT */
 }
 #endif /* CONFIG_BT_SUBRATING */
 
@@ -3523,7 +3564,16 @@ int bt_conn_le_read_all_remote_features(struct bt_conn *conn, uint8_t pages_requ
 	cp->handle = sys_cpu_to_le16(conn->handle);
 	cp->pages_requested = pages_requested;
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_read_all_remote_features_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_read_all_remote_features(
+			(const sdc_hci_cmd_le_read_all_remote_features_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_READ_ALL_REMOTE_FEATURES, buf, NULL);
+#endif /* CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT */
 }
 #endif /* CONFIG_BT_LE_EXTENDED_FEAT_SET */
 
@@ -3595,7 +3645,16 @@ int bt_conn_le_frame_space_update(struct bt_conn *conn,
 	cp->spacing_types = sys_cpu_to_le16(param->spacing_types);
 	cp->phys = param->phys;
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_frame_space_update_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_frame_space_update(
+			(const sdc_hci_cmd_le_frame_space_update_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_FRAME_SPACE_UPDATE, buf, NULL);
+#endif /* CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT */
 }
 #endif /* CONFIG_BT_FRAME_SPACE_UPDATE */
 
@@ -4151,6 +4210,8 @@ int bt_conn_le_create_synced(const struct bt_le_ext_adv *adv,
 }
 #endif /* CONFIG_BT_CENTRAL */
 
+/* SDC Peripheral does support this command, L2CAP is used instead. */
+#if defined(CONFIG_BT_CENTRAL) && defined(CONFIG_BT_LL_SOFTDEVICE)
 int bt_conn_le_conn_update(struct bt_conn *conn,
 			   const struct bt_le_conn_param *param)
 {
@@ -4170,8 +4231,18 @@ int bt_conn_le_conn_update(struct bt_conn *conn,
 	conn_update->conn_latency = sys_cpu_to_le16(param->latency);
 	conn_update->supervision_timeout = sys_cpu_to_le16(param->timeout);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*conn_update) == sizeof(sdc_hci_cmd_le_conn_update_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_conn_update(
+			(const sdc_hci_cmd_le_conn_update_t *)conn_update));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_CONN_UPDATE, buf, NULL);
+#endif
 }
+#endif /* CONFIG_BT_CENTRAL && CONFIG_BT_LL_SOFTDEVICE */
 
 #if defined(CONFIG_BT_SMP) || defined(CONFIG_BT_CLASSIC)
 int bt_conn_auth_cb_register(const struct bt_conn_auth_cb *cb)

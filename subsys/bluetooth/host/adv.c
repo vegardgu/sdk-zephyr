@@ -36,6 +36,12 @@
 #include "scan.h"
 #include "adv.h"
 
+
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+#include "sdc_hci_cmd_le.h"
+#include <multithreading_lock.h>
+#endif
+
 #define LOG_LEVEL CONFIG_BT_HCI_CORE_LOG_LEVEL
 LOG_MODULE_REGISTER(bt_adv);
 
@@ -316,7 +322,7 @@ struct bt_le_ext_adv *bt_le_adv_lookup_legacy(void)
 int bt_le_adv_set_enable_legacy(struct bt_le_ext_adv *adv, bool enable)
 {
 	struct net_buf *buf;
-	struct bt_hci_cmd_state_set state;
+	struct bt_hci_cp_le_set_adv_enable *cp;
 	int err;
 
 	buf = bt_hci_cmd_alloc(K_FOREVER);
@@ -324,15 +330,34 @@ int bt_le_adv_set_enable_legacy(struct bt_le_ext_adv *adv, bool enable)
 		return -ENOBUFS;
 	}
 
-	if (enable) {
-		net_buf_add_u8(buf, BT_HCI_LE_ADV_ENABLE);
-	} else {
-		net_buf_add_u8(buf, BT_HCI_LE_ADV_DISABLE);
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->enable = enable ? BT_HCI_LE_ADV_ENABLE : BT_HCI_LE_ADV_DISABLE;
+
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_set_adv_enable_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_adv_enable(
+			(const sdc_hci_cmd_le_set_adv_enable_t *)cp));
+	net_buf_unref(buf);
+
+	if (err) {
+		return err;
 	}
+
+	/* Since hci_cmd_done is not called, we need to update this manually. */
+	if (enable) {
+		atomic_set_bit(adv->flags, BT_ADV_ENABLED);
+	} else {
+		atomic_clear_bit(adv->flags, BT_ADV_ENABLED);
+	}
+
+#else
+	struct bt_hci_cmd_state_set state;
 
 	bt_hci_cmd_state_set_init(buf, &state, adv->flags, BT_ADV_ENABLED, enable);
 
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_ADV_ENABLE, buf, NULL);
+#endif
 	if (err) {
 		return err;
 	}
@@ -345,7 +370,6 @@ int bt_le_adv_set_enable_ext(struct bt_le_ext_adv *adv,
 			 const struct bt_le_ext_adv_start_param *param)
 {
 	struct net_buf *buf;
-	struct bt_hci_cmd_state_set state;
 	int err;
 
 	buf = bt_hci_cmd_alloc(K_FOREVER);
@@ -365,13 +389,33 @@ int bt_le_adv_set_enable_ext(struct bt_le_ext_adv *adv,
 	net_buf_add_le16(buf, param ? param->timeout : 0);
 	net_buf_add_u8(buf, param ? param->num_events : 0);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	sdc_hci_cmd_le_set_ext_adv_enable_t *params = (sdc_hci_cmd_le_set_ext_adv_enable_t *)buf->data;
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_ext_adv_enable(params));
+	net_buf_unref(buf);
+
+	if (err) {
+		return err;
+	}
+
+	/* This is usually done by hci_cmd_done, but since hci_cmd_done is not called,
+	 * the flag must be set after successful command. */
+	if (enable) {
+		atomic_set_bit(adv->flags, BT_ADV_ENABLED);
+	} else {
+		atomic_clear_bit(adv->flags, BT_ADV_ENABLED);
+	}
+#else
+	struct bt_hci_cmd_state_set state;
+
 	bt_hci_cmd_state_set_init(buf, &state, adv->flags, BT_ADV_ENABLED, enable);
 
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_EXT_ADV_ENABLE, buf, NULL);
 	if (err) {
 		return err;
 	}
-
+#endif
 	return 0;
 }
 
@@ -540,7 +584,29 @@ static int hci_set_ad(uint16_t hci_op, const struct bt_ad *ad, size_t ad_len)
 		return err;
 	}
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	int sdc_err;
+
+	if (hci_op == BT_HCI_OP_LE_SET_ADV_DATA) {
+		BUILD_ASSERT(sizeof(*set_data) == sizeof(sdc_hci_cmd_le_set_adv_data_t));
+		sdc_err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_adv_data(
+				(const sdc_hci_cmd_le_set_adv_data_t *)set_data));
+	} else if (hci_op == BT_HCI_OP_LE_SET_SCAN_RSP_DATA) {
+		BUILD_ASSERT(sizeof(*set_data) == sizeof(sdc_hci_cmd_le_set_scan_response_data_t));
+		sdc_err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_scan_response_data(
+				(const sdc_hci_cmd_le_set_scan_response_data_t *)set_data));
+	} else {
+		net_buf_unref(buf);
+		return -EINVAL;
+	}
+
+	net_buf_unref(buf);
+	return sdc_err;
+#else
 	return bt_hci_cmd_send_sync(hci_op, buf, NULL);
+#endif
 }
 
 static int hci_set_adv_ext_complete(struct bt_le_ext_adv *adv, uint16_t hci_op,
@@ -578,7 +644,26 @@ static int hci_set_adv_ext_complete(struct bt_le_ext_adv *adv, uint16_t hci_op,
 	set_data->op = BT_HCI_LE_EXT_ADV_OP_COMPLETE_DATA;
 	set_data->frag_pref = BT_HCI_LE_EXT_ADV_FRAG_DISABLED;
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	if (hci_op == BT_HCI_OP_LE_SET_EXT_ADV_DATA) {
+		BUILD_ASSERT(sizeof(*set_data) == sizeof(sdc_hci_cmd_le_set_ext_adv_data_t));
+		err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_ext_adv_data(
+				(const sdc_hci_cmd_le_set_ext_adv_data_t *)set_data));
+	} else if (hci_op == BT_HCI_OP_LE_SET_EXT_SCAN_RSP_DATA) {
+		BUILD_ASSERT(sizeof(*set_data) == sizeof(sdc_hci_cmd_le_set_ext_scan_response_data_t));
+		err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_ext_scan_response_data(
+				(const sdc_hci_cmd_le_set_ext_scan_response_data_t *)set_data));
+	} else {
+		net_buf_unref(buf);
+		return -EINVAL;
+	}
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(hci_op, buf, NULL);
+#endif
 }
 
 static int hci_set_adv_ext_fragmented(struct bt_le_ext_adv *adv, uint16_t hci_op,
@@ -620,7 +705,25 @@ static int hci_set_adv_ext_fragmented(struct bt_le_ext_adv *adv, uint16_t hci_op
 			set_data->op = BT_HCI_LE_EXT_ADV_OP_INTERM_FRAG;
 		}
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+		if (hci_op == BT_HCI_OP_LE_SET_EXT_ADV_DATA) {
+			BUILD_ASSERT(sizeof(*set_data) == sizeof(sdc_hci_cmd_le_set_ext_adv_data_t));
+			err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+				sdc_hci_cmd_le_set_ext_adv_data(
+					(const sdc_hci_cmd_le_set_ext_adv_data_t *)set_data));
+		} else if (hci_op == BT_HCI_OP_LE_SET_EXT_SCAN_RSP_DATA) {
+			BUILD_ASSERT(sizeof(*set_data) == sizeof(sdc_hci_cmd_le_set_ext_scan_response_data_t));
+			err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+				sdc_hci_cmd_le_set_ext_scan_response_data(
+					(const sdc_hci_cmd_le_set_ext_scan_response_data_t *)set_data));
+		} else {
+			net_buf_unref(buf);
+			return -EINVAL;
+		}
+		net_buf_unref(buf);
+#else
 		err = bt_hci_cmd_send_sync(hci_op, buf, NULL);
+#endif
 		if (err) {
 			return err;
 		}
@@ -995,7 +1098,16 @@ static int adv_start_legacy(struct bt_le_ext_adv *adv,
 
 	net_buf_add_mem(buf, &set_param, sizeof(set_param));
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(set_param) == sizeof(sdc_hci_cmd_le_set_adv_params_t),
+		     "LE Set Adv Params structs must match");
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_adv_params(
+			(const sdc_hci_cmd_le_set_adv_params_t *)&set_param));
+	net_buf_unref(buf);
+#else
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_ADV_PARAM, buf, NULL);
+#endif
 	if (err) {
 		return err;
 	}
@@ -1053,7 +1165,7 @@ static int le_ext_adv_param_set(struct bt_le_ext_adv *adv,
 	uint16_t opcode;
 	uint16_t size;
 	bool dir_adv = param->peer != NULL, scannable;
-	struct net_buf *buf, *rsp;
+	struct net_buf *buf;
 	uint8_t own_addr_type;
 	int err;
 	uint16_t props = 0;
@@ -1175,6 +1287,38 @@ static int le_ext_adv_param_set(struct bt_le_ext_adv *adv,
 
 	cp->props = sys_cpu_to_le16(props);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	sdc_hci_cmd_le_set_ext_adv_params_return_t rsp;
+	if (opcode == BT_HCI_OP_LE_SET_EXT_ADV_PARAM) {
+		BUILD_ASSERT(sizeof(struct bt_hci_cp_le_set_ext_adv_param)
+				== sizeof(sdc_hci_cmd_le_set_ext_adv_params_t));
+		err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_ext_adv_params(
+				(const sdc_hci_cmd_le_set_ext_adv_params_t *)cp, &rsp));
+	} else if (opcode == BT_HCI_OP_LE_SET_EXT_ADV_PARAM_V2) {
+		BUILD_ASSERT(sizeof(struct bt_hci_cp_le_set_ext_adv_param_v2)
+				== sizeof(sdc_hci_cmd_le_set_ext_adv_params_v2_t));
+		BUILD_ASSERT(sizeof(sdc_hci_cmd_le_set_ext_adv_params_return_t)
+				== sizeof(sdc_hci_cmd_le_set_ext_adv_params_v2_return_t));
+		err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_ext_adv_params_v2(
+				(const sdc_hci_cmd_le_set_ext_adv_params_v2_t *)cp,
+				(sdc_hci_cmd_le_set_ext_adv_params_v2_return_t *)&rsp));
+	} else {
+		net_buf_unref(buf);
+		return -EINVAL;
+	}
+	net_buf_unref(buf);
+	if (err) {
+		return err;
+	}
+
+#if defined(CONFIG_BT_EXT_ADV)
+	adv->tx_power = rsp.selected_tx_power;
+#endif
+
+#else
+	struct net_buf *rsp;
 	err = bt_hci_cmd_send_sync(opcode, buf, &rsp);
 	if (err) {
 		return err;
@@ -1187,6 +1331,7 @@ static int le_ext_adv_param_set(struct bt_le_ext_adv *adv,
 #endif /* defined(CONFIG_BT_EXT_ADV) */
 
 	net_buf_unref(rsp);
+#endif
 
 	atomic_set_bit(adv->flags, BT_ADV_PARAMS_SET);
 

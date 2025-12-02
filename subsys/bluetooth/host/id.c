@@ -43,6 +43,13 @@
 #include "settings.h"
 #include "smp.h"
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+#include <sdc_hci_cmd_info_params.h>
+#include <sdc_hci_cmd_le.h>
+#include <sdc_hci_vs.h>
+#include <multithreading_lock.h>
+#endif
+
 #define LOG_LEVEL CONFIG_BT_HCI_CORE_LOG_LEVEL
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(bt_id);
@@ -134,6 +141,7 @@ static int set_random_address(const bt_addr_t *addr)
 {
 	struct net_buf *buf;
 	int err;
+	struct bt_hci_cp_le_set_random_address *cp;
 
 	LOG_DBG("%s", bt_addr_str(addr));
 
@@ -147,9 +155,19 @@ static int set_random_address(const bt_addr_t *addr)
 		return -ENOBUFS;
 	}
 
-	net_buf_add_mem(buf, addr, sizeof(*addr));
+	cp = net_buf_add(buf, sizeof(*cp));
+	bt_addr_copy(&cp->bdaddr, addr);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_set_random_address_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_random_address(
+			(const sdc_hci_cmd_le_set_random_address_t *)cp));
+	net_buf_unref(buf);
+#else
+	net_buf_add_mem(buf, addr, sizeof(addr));
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_RANDOM_ADDRESS, buf, NULL);
+#endif
 	if (err) {
 		if (err == -EACCES) {
 			/* If we are here we probably tried to set a random
@@ -203,8 +221,16 @@ int bt_id_set_adv_random_addr(struct bt_le_ext_adv *adv,
 	cp->handle = adv->handle;
 	bt_addr_copy(&cp->bdaddr, addr);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_set_adv_set_random_address_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_adv_set_random_address(
+			(const sdc_hci_cmd_le_set_adv_set_random_address_t *)cp));
+	net_buf_unref(buf);
+#else
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_ADV_SET_RANDOM_ADDR, buf,
 				   NULL);
+#endif
 	if (err) {
 		return err;
 	}
@@ -322,7 +348,17 @@ static void le_rpa_timeout_update(void)
 
 		cp = net_buf_add(buf, sizeof(*cp));
 		cp->rpa_timeout = sys_cpu_to_le16(bt_dev.rpa_timeout);
+
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+		BUILD_ASSERT(sizeof(*cp) ==
+			     sizeof(sdc_hci_cmd_le_set_resolvable_private_address_timeout_t));
+		err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+			sdc_hci_cmd_le_set_resolvable_private_address_timeout(
+				(const sdc_hci_cmd_le_set_resolvable_private_address_timeout_t *)cp));
+		net_buf_unref(buf);
+#else
 		err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_RPA_TIMEOUT, buf, NULL);
+#endif
 		if (err) {
 			LOG_ERR("Failed to send HCI RPA timeout command");
 			goto submit;
@@ -854,7 +890,15 @@ static int le_set_privacy_mode(const bt_addr_le_t *addr, uint8_t mode)
 
 	net_buf_add_mem(buf, &cp, sizeof(cp));
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(cp) == sizeof(sdc_hci_cmd_le_set_privacy_mode_t));
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_privacy_mode(
+			(const sdc_hci_cmd_le_set_privacy_mode_t *)&cp));
+	net_buf_unref(buf);
+#else
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_PRIVACY_MODE, buf, NULL);
+#endif
 	if (err) {
 		return err;
 	}
@@ -864,6 +908,7 @@ static int le_set_privacy_mode(const bt_addr_le_t *addr, uint8_t mode)
 
 static int addr_res_enable(uint8_t enable)
 {
+	struct bt_hci_cp_le_set_addr_res_enable *cp;
 	struct net_buf *buf;
 
 	LOG_DBG("%s", enable ? "enabled" : "disabled");
@@ -873,10 +918,21 @@ static int addr_res_enable(uint8_t enable)
 		return -ENOBUFS;
 	}
 
-	net_buf_add_u8(buf, enable);
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->enable = enable;
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) ==
+		     sizeof(sdc_hci_cmd_le_set_address_resolution_enable_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_set_address_resolution_enable(
+			(const sdc_hci_cmd_le_set_address_resolution_enable_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_SET_ADDR_RES_ENABLE,
 				    buf, NULL);
+#endif
 }
 
 static int hci_id_add(uint8_t id, const bt_addr_le_t *addr, uint8_t peer_irk[16])
@@ -905,7 +961,16 @@ static int hci_id_add(uint8_t id, const bt_addr_le_t *addr, uint8_t peer_irk[16]
 	(void)memset(cp->local_irk, 0, 16);
 #endif
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_add_device_to_resolving_list_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_add_device_to_resolving_list(
+			(const sdc_hci_cmd_le_add_device_to_resolving_list_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_ADD_DEV_TO_RL, buf, NULL);
+#endif
 }
 
 static void pending_id_update(struct bt_keys *keys, void *data)
@@ -1151,7 +1216,11 @@ void bt_id_add(struct bt_keys *keys)
 		 * don't need to enable the address resolution.
 		 */
 		enable_controller_res = false;
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+		err = MULTITHREADING_LOCK_SDC_HCI_CMD(sdc_hci_cmd_le_clear_resolving_list());
+#else
 		err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_CLEAR_RL, NULL, NULL);
+#endif
 		if (err) {
 			LOG_ERR("Failed to clear resolution list");
 			goto done;
@@ -1228,7 +1297,16 @@ static int hci_id_del(const bt_addr_le_t *addr)
 	cp = net_buf_add(buf, sizeof(*cp));
 	bt_addr_le_copy(&cp->peer_id_addr, addr);
 
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	BUILD_ASSERT(sizeof(*cp) == sizeof(sdc_hci_cmd_le_remove_device_from_resolving_list_t));
+	int err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_le_remove_device_from_resolving_list(
+			(const sdc_hci_cmd_le_remove_device_from_resolving_list_t *)cp));
+	net_buf_unref(buf);
+	return err;
+#else
 	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_REM_DEV_FROM_RL, buf, NULL);
+#endif
 }
 
 void bt_id_del(struct bt_keys *keys)
@@ -1700,6 +1778,19 @@ static void bt_read_identity_root(uint8_t *ir)
 	memset(ir, 0, 16);
 
 #if defined(CONFIG_BT_HCI_VS)
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	sdc_hci_cmd_vs_zephyr_read_key_hierarchy_roots_return_t rsp;
+	int err;
+
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_vs_zephyr_read_key_hierarchy_roots(&rsp));
+	if (err) {
+		LOG_WRN("Failed to read identity root");
+		return;
+	}
+
+	memcpy(ir, rsp.ir, sizeof(rsp.ir));
+#else
 	struct bt_hci_rp_vs_read_key_hierarchy_roots *rp;
 	struct net_buf *rsp;
 	int err;
@@ -1726,20 +1817,41 @@ static void bt_read_identity_root(uint8_t *ir)
 	memcpy(ir, rp->ir, 16);
 
 	net_buf_unref(rsp);
+#endif /* defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT) */
 #endif /* defined(CONFIG_BT_HCI_VS) */
 }
 #endif /* defined(CONFIG_BT_PRIVACY) */
 
 uint8_t bt_id_read_public_addr(bt_addr_le_t *addr)
 {
-	struct bt_hci_rp_read_bd_addr *rp;
-	struct net_buf *rsp;
 	int err;
 
 	CHECKIF(addr == NULL) {
 		LOG_WRN("Invalid input parameters");
 		return 0U;
 	}
+
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	sdc_hci_cmd_ip_read_bd_addr_return_t rsp;
+
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(sdc_hci_cmd_ip_read_bd_addr(&rsp));
+	if (err) {
+		LOG_WRN("Failed to read public address");
+		return 0U;
+	}
+
+	const bt_addr_t *bdaddr = (const bt_addr_t *)&rsp.bd_addr[0];
+
+	if (bt_addr_eq(bdaddr, BT_ADDR_ANY) || bt_addr_eq(bdaddr, BT_ADDR_NONE)) {
+		LOG_DBG("Controller has no public address");
+		return 0U;
+	}
+
+	bt_addr_copy(&addr->a, bdaddr);
+    addr->type = BT_ADDR_LE_PUBLIC;
+#else
+	struct bt_hci_rp_read_bd_addr *rp;
+	struct net_buf *rsp;
 
 	/* Read Bluetooth Address */
 	err = bt_hci_cmd_send_sync(BT_HCI_OP_READ_BD_ADDR, NULL, &rsp);
@@ -1761,6 +1873,7 @@ uint8_t bt_id_read_public_addr(bt_addr_le_t *addr)
 	addr->type = BT_ADDR_LE_PUBLIC;
 
 	net_buf_unref(rsp);
+#endif
 	return 1U;
 }
 
@@ -1804,6 +1917,34 @@ int bt_setup_public_id_addr(void)
 static uint8_t vs_read_static_addr(struct bt_hci_vs_static_addr addrs[], uint8_t size)
 {
 #if defined(CONFIG_BT_HCI_VS)
+#if defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT)
+	struct {
+		sdc_hci_cmd_vs_zephyr_read_static_addresses_return_t hdr;
+		sdc_hci_vs_zephyr_static_address_t addr[CONFIG_BT_ID_MAX];
+	} __packed rsp;
+	int err;
+	uint8_t cnt;
+
+	err = MULTITHREADING_LOCK_SDC_HCI_CMD(
+		sdc_hci_cmd_vs_zephyr_read_static_addresses(&rsp.hdr));
+	if (err) {
+		LOG_WRN("Failed to read static addresses");
+		return 0;
+	}
+
+	cnt = MIN(rsp.hdr.num_addresses, size);
+
+	for (uint8_t i = 0U; i < cnt; i++) {
+		memcpy(addrs[i].bdaddr.val, rsp.addr[i].address, sizeof(addrs[i].bdaddr.val));
+		memcpy(addrs[i].ir, rsp.addr[i].identity_root, sizeof(addrs[i].ir));
+	}
+
+	if (!cnt) {
+		LOG_WRN("No static addresses stored in controller");
+	}
+
+	return cnt;
+#else
 	struct bt_hci_rp_vs_read_static_addrs *rp;
 	struct net_buf *rsp;
 	int err, i;
@@ -1849,9 +1990,9 @@ static uint8_t vs_read_static_addr(struct bt_hci_vs_static_addr addrs[], uint8_t
 	}
 
 	return cnt;
-#else
+#endif /* defined(CONFIG_BT_SDC_CONTROLLER_HOST_DIRECT) */
+#endif /* defined(CONFIG_BT_HCI_VS) */
 	return 0;
-#endif
 }
 
 int bt_setup_random_id_addr(void)
