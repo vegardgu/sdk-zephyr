@@ -21,6 +21,7 @@
 #include <zephyr/init.h>
 #include <zephyr/drivers/uart.h>
 
+#include <zephyr/sys/atomic.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/l2cap.h>
@@ -30,7 +31,7 @@
 #include <zephyr/bluetooth/hci_vs.h>
 
 #define LOG_MODULE_NAME hci_uart
-LOG_MODULE_REGISTER(LOG_MODULE_NAME);
+LOG_MODULE_REGISTER(LOG_MODULE_NAME,LOG_LEVEL_DBG);
 
 static const struct device *const hci_uart_dev =
 	DEVICE_DT_GET(DT_CHOSEN(zephyr_bt_c2h_uart));
@@ -248,6 +249,71 @@ static void bt_uart_isr(const struct device *unused, void *user_data)
 	}
 }
 
+/* ----------------------------------------------------------------------------
+ * HCI_Reset Set_Event_Mask workaround
+ *
+ * Some HCI hosts (notably Android) reset the controller but never send
+ * HCI_Set_Event_Mask afterwards. Per Core 6.3 Vol 4 Part E 7.3.1, the spec
+ * default of the classic Event Mask is 0x00001FFFFFFFFFFF, which leaves bit
+ * 61 (LE Meta event) CLEARED. The SoftDevice Controller follows the spec
+ * strictly: while bit 61 is clear it filters out every LE event before any
+ * LE Event Mask is consulted, so scanning succeeds at the link layer but the
+ * host never sees a single report.
+ *
+ * Workaround: after every successful HCI_Reset, inject HCI_Set_Event_Mask
+ * (FF*8) and swallow the matching Command_Complete so the host's command-
+ * pipeline accounting stays consistent. If the host sends its own
+ * HCI_Set_Event_Mask later, that value replaces ours (the SDC just memcpy's
+ * it), so this only restores a sane default and does not override host
+ * policy.
+  * --------------------------------------------------------------------------*/
+static atomic_t cmd_completes_to_swallow;
+
+static bool buf_is_cmd_complete_for_opcode(const struct net_buf *buf,
+					   uint16_t opcode)
+{
+	/* CONFIG_BT_HCI_RAW_H4=y => event buffers carry the H:4 type byte.
+	 * Layout for Command Complete:
+	 *   [0]=H4_EVT, [1]=evt_code, [2]=param_len, [3]=ncmd,
+	 *   [4..5]=opcode, [6]=status
+	 */
+	if (buf->len < 6 || buf->data[0] != H4_EVT ||
+	    buf->data[1] != BT_HCI_EVT_CMD_COMPLETE) {
+		return false;
+	}
+	return sys_get_le16(&buf->data[4]) == opcode;
+}
+
+static void inject_enable_all_events(void)
+{
+	struct net_buf *cmd;
+	struct bt_hci_cmd_hdr hdr;
+	uint8_t mask[8];
+
+	cmd = bt_buf_get_tx(BT_BUF_CMD, K_NO_WAIT, NULL, 0);
+	if (!cmd) {
+		LOG_WRN("HCI_Reset workaround: out of TX bufs, skipping inject");
+		return;
+	}
+
+	hdr.opcode = sys_cpu_to_le16(BT_HCI_OP_SET_EVENT_MASK);
+	hdr.param_len = sizeof(mask);
+	net_buf_add_mem(cmd, &hdr, sizeof(hdr));
+	memset(mask, 0xFF, sizeof(mask));
+	net_buf_add_mem(cmd, mask, sizeof(mask));
+
+	/* Increment BEFORE bt_send so the RX loop cannot race us and forward
+	 * the CC to the host.
+	 */
+	atomic_inc(&cmd_completes_to_swallow);
+
+	if (bt_send(cmd) != 0) {
+		atomic_dec(&cmd_completes_to_swallow);
+		net_buf_unref(cmd);
+		LOG_WRN("HCI_Reset workaround: bt_send failed");
+	}
+}
+
 static void tx_thread(void *p1, void *p2, void *p3)
 {
 	while (1) {
@@ -256,6 +322,7 @@ static void tx_thread(void *p1, void *p2, void *p3)
 
 		/* Wait until a buffer is available */
 		buf = k_fifo_get(&tx_queue, K_FOREVER);
+
 		/* Pass buffer to the stack */
 		err = bt_send(buf);
 		if (err) {
@@ -398,6 +465,28 @@ static int hci_uart_init(void)
 
 SYS_INIT(hci_uart_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEVICE);
 
+#if defined(CONFIG_BT_LL_SOFTDEVICE)
+void bt_ctlr_set_public_addr(const uint8_t *addr);
+
+static void set_fixed_public_addr(void)
+{
+	/*
+	 * SDC VS Write BD_ADDR expects the six address bytes as they are sent over HCI,
+	 * i.e. least significant byte first.
+	 */
+	static const uint8_t public_addr[6] = {
+		0x1e, 0x90, 0xf2, 0x27, 0x87, 0x04 /* 04:87:27:f2:90:1e */
+	};
+
+	bt_ctlr_set_public_addr(public_addr);
+	LOG_WRN("Controller BD_ADDR forced to 04:87:27:f2:90:1e");
+}
+#else
+static void set_fixed_public_addr(void)
+{
+}
+#endif
+
 int main(void)
 {
 	/* incoming events and data from the controller */
@@ -406,9 +495,12 @@ int main(void)
 
 	LOG_DBG("Start");
 	__ASSERT(hci_uart_dev, "UART device is NULL");
+	LOG_INF("App started");
+    LOG_DBG("App debug message");
 
 	/* Enable the raw interface, this will in turn open the HCI driver */
 	bt_enable_raw(&rx_queue);
+	set_fixed_public_addr();
 
 	if (IS_ENABLED(CONFIG_BT_WAIT_NOP)) {
 		/* Issue a Command Complete with NOP */
@@ -448,6 +540,28 @@ int main(void)
 		struct net_buf *buf;
 
 		buf = k_fifo_get(&rx_queue, K_FOREVER);
+
+		/* HCI_Reset workaround: hide the Command Complete for our injected
+		 * HCI_Set_Event_Mask so the host never sees a Command Complete for a
+		 * command it did not send.
+		 */
+		if (atomic_get(&cmd_completes_to_swallow) > 0 &&
+		    buf_is_cmd_complete_for_opcode(buf,
+						   BT_HCI_OP_SET_EVENT_MASK)) {
+			atomic_dec(&cmd_completes_to_swallow);
+			net_buf_unref(buf);
+			continue;
+		}
+
+		/* HCI_Reset workaround: after every successful Command Complete for Reset,
+		 * inject HCI_Set_Event_Mask(FF*8) BEFORE forwarding the Command Complete
+		 * to the host.
+		 */
+		if (buf_is_cmd_complete_for_opcode(buf, BT_HCI_OP_RESET) &&
+		    buf->len >= 7 && buf->data[6] == 0x00) {
+			inject_enable_all_events();
+		}
+
 		err = h4_send(buf);
 		if (err) {
 			LOG_ERR("Failed to send");

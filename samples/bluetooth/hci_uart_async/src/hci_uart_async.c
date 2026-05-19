@@ -22,6 +22,7 @@
 #include <zephyr/usb/usb_device.h>
 
 #include <zephyr/net_buf.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/l2cap.h>
 #include <zephyr/bluetooth/hci.h>
@@ -157,6 +158,69 @@ static void send_hw_error(void)
 	/* The c2h thread will send the message at some point. The host
 	 * will receive it and reset the controller.
 	 */
+}
+
+/* ----------------------------------------------------------------------------
+ * HCI_Reset Set_Event_Mask workaround
+ *
+ * Some HCI hosts (notably Android) reset the controller but never send
+ * HCI_Set_Event_Mask afterwards. Per Core 6.3 Vol 4 Part E 7.3.1, the spec
+ * default of the classic Event Mask is 0x00001FFFFFFFFFFF, which leaves bit
+ * 61 (LE Meta event) CLEARED. The SoftDevice Controller follows the spec
+ * strictly: while bit 61 is clear it filters out every LE event before any
+ * LE Event Mask is consulted, so scanning succeeds at the link layer but the
+ * host never sees a single report.
+ *
+ * Workaround: after every successful HCI_Reset, inject
+ * HCI_Set_Event_Mask(0xFFFFFFFFFFFFFFFF) and swallow the matching
+ * Command_Complete so the host's command-pipeline accounting stays
+ * consistent. If the host later sends its own HCI_Set_Event_Mask, the SDC
+ * overwrites our value, so this only restores a sane default and does not
+ * override host policy.
+ * --------------------------------------------------------------------------*/
+
+static atomic_t pending_event_mask_cc_swallow;
+
+static const uint8_t hci_set_event_mask_ff[] = {
+	0x01, 0x0C, /* opcode 0x0C01 = HCI_Set_Event_Mask, little-endian */
+	0x08,       /* param_len */
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+};
+
+static void inject_enable_le_meta_event(void)
+{
+	struct net_buf *cmd;
+	int err;
+
+	cmd = bt_buf_get_tx(BT_BUF_CMD, K_NO_WAIT,
+			    hci_set_event_mask_ff, sizeof(hci_set_event_mask_ff));
+	if (!cmd) {
+		LOG_WRN("HCI_Reset workaround: out of TX bufs, skipping inject");
+		return;
+	}
+
+	atomic_inc(&pending_event_mask_cc_swallow);
+
+	err = bt_send(cmd);
+	if (err) {
+		atomic_dec(&pending_event_mask_cc_swallow);
+		net_buf_unref(cmd);
+		LOG_WRN("HCI_Reset workaround: bt_send err %d", err);
+	}
+}
+
+/* c2h buffer layout (CONFIG_BT_HCI_RAW_H4=y):
+ *   [0]=H4_EVT, [1]=evt_code, [2]=param_len, [3]=ncmd, [4..5]=opcode, [6]=status
+ */
+static bool buf_is_cmd_complete_for_opcode(const struct net_buf *buf,
+					   uint16_t opcode)
+{
+	if (buf->len < 6 ||
+	    buf->data[0] != BT_HCI_H4_EVT ||
+	    buf->data[1] != BT_HCI_EVT_CMD_COMPLETE) {
+		return false;
+	}
+	return sys_get_le16(&buf->data[4]) == opcode;
 }
 
 static void recover_sync_by_reset_pattern(void)
@@ -375,10 +439,54 @@ static void c2h_thread_entry(void)
 		struct net_buf *buf;
 
 		buf = k_fifo_get(&c2h_queue, K_FOREVER);
+
+		/* HCI_Reset workaround: hide the CC for our injected
+		 * HCI_Set_Event_Mask so the host never sees a CC for a
+		 * command it did not send.
+		 */
+		if (atomic_get(&pending_event_mask_cc_swallow) > 0 &&
+		    buf_is_cmd_complete_for_opcode(buf, BT_HCI_OP_SET_EVENT_MASK)) {
+			atomic_dec(&pending_event_mask_cc_swallow);
+			net_buf_unref(buf);
+			continue;
+		}
+
+		/* HCI_Reset workaround: after every successful CC(Reset),
+		 * inject HCI_Set_Event_Mask(0xFF..FF) BEFORE forwarding the
+		 * CC to the host.
+		 */
+		if (buf_is_cmd_complete_for_opcode(buf, BT_HCI_OP_RESET) &&
+		    buf->len >= 7 && buf->data[6] == 0x00) {
+			inject_enable_le_meta_event();
+		}
+
 		uart_c2h_tx(buf->data, buf->len);
 		net_buf_unref(buf);
 	}
 }
+
+
+#if defined(CONFIG_BT_LL_SOFTDEVICE)
+void bt_ctlr_set_public_addr(const uint8_t *addr);
+
+static void set_fixed_public_addr(void)
+{
+	/*
+	 * SDC VS Write BD_ADDR expects the six address bytes as they are sent over HCI,
+	 * i.e. least significant byte first.
+	 */
+	static const uint8_t public_addr[6] = {
+		0x1e, 0x90, 0xf2, 0x27, 0x87, 0x04 /* 04:87:27:f2:90:1e */
+	};
+
+	bt_ctlr_set_public_addr(public_addr);
+	LOG_WRN("Controller BD_ADDR forced to 04:87:27:f2:90:1e");
+}
+#else
+static void set_fixed_public_addr(void)
+{
+}
+#endif
 
 void hci_uart_main(void)
 {
@@ -386,6 +494,7 @@ void hci_uart_main(void)
 
 	err = bt_enable_raw(&c2h_queue);
 	__ASSERT_NO_MSG(!err);
+	set_fixed_public_addr();
 
 	/* TX thread. */
 	k_thread_create(&h2c_thread, h2c_thread_stack, K_THREAD_STACK_SIZEOF(h2c_thread_stack),
